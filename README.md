@@ -1,5 +1,4 @@
-Understood — here is a **clean, compact, properly formatted README** that is ideal for viewing and editing inside **nano** (no heavy formatting, no emojis, no long decorative blocks, no images).
-It keeps the structure clear and readable in a plain-text environment.
+
 
 ---
 
