@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 
+import sys
+import os
+
+# Add current directory to Python path for imports
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import Imu, NavSatFix, JointState
+from sensor_msgs.msg import Imu, NavSatFix, JointState, LaserScan
 from nav_msgs.msg import Odometry
 from diagnostic_msgs.msg import DiagnosticArray
 from geometry_msgs.msg import Twist
@@ -13,13 +19,26 @@ import threading
 import math
 import json
 import csv
-import os
 from datetime import datetime
 from collections import deque
 import subprocess
 
+try:
+    from anomaly_detector import HuskyAnomalyDetector
+    ANOMALY_DETECTION_AVAILABLE = True
+except ImportError as e:
+    print(f"⚠️  Anomaly detection not available: {e}")
+    ANOMALY_DETECTION_AVAILABLE = False
+    HuskyAnomalyDetector = None
+
 app = Flask(__name__)
 CORS(app)
+
+# Global anomaly detector
+if ANOMALY_DETECTION_AVAILABLE:
+    anomaly_detector = HuskyAnomalyDetector()
+else:
+    anomaly_detector = None
 
 class HuskyDashboard(Node):
     def __init__(self):
@@ -38,6 +57,15 @@ class HuskyDashboard(Node):
                 "velocity": {"linear": 0.0, "angular": 0.0}
             },
             "cmd_vel": {"linear": 0.0, "angular": 0.0},
+            "scan": {
+                "range_min": 0.0,
+                "range_max": 0.0,
+                "avg_range": 0.0,
+                "min_range": 0.0,
+                "max_range": 0.0,
+                "num_readings": 0,
+                "obstacles_detected": 0
+            },
             "joints": [],
             "diagnostics": [],
             "last_update": datetime.now().isoformat()
@@ -53,6 +81,8 @@ class HuskyDashboard(Node):
             "acceleration_x": deque(maxlen=100),
             "acceleration_y": deque(maxlen=100),
             "acceleration_z": deque(maxlen=100),
+            "scan_avg_range": deque(maxlen=100),
+            "scan_min_range": deque(maxlen=100),
         }
         
         # Data logging
@@ -68,6 +98,10 @@ class HuskyDashboard(Node):
             "angular_velocity": 3.0
         }
         
+        # Anomaly detection
+        self.anomaly_alerts = []
+        self.current_anomaly_status = {"is_anomaly": False, "score": 0.0, "features": {}}
+        
         # Bag playback control
         self.bag_process = None
         self.bag_file_path = None
@@ -79,6 +113,7 @@ class HuskyDashboard(Node):
         self.joint_sub = self.create_subscription(JointState, '/joint_states', self.joint_callback, 10)
         self.cmd_vel_sub = self.create_subscription(Twist, '/cmd_vel', self.cmd_vel_callback, 10)
         self.diag_sub = self.create_subscription(DiagnosticArray, '/diagnostics', self.diagnostics_callback, 10)
+        self.scan_sub = self.create_subscription(LaserScan, '/scan', self.scan_callback, 10)
         
         self.get_logger().info('Husky Dashboard Node Started')
         
@@ -126,6 +161,52 @@ class HuskyDashboard(Node):
         if len(self.alerts) > 50:
             self.alerts = self.alerts[-50:]
     
+    def check_anomaly(self):
+        """Check current data for anomalies using ML model"""
+        global anomaly_detector
+        
+        if not ANOMALY_DETECTION_AVAILABLE or not anomaly_detector or not anomaly_detector.is_trained:
+            return
+        
+        try:
+            # Create data entry for anomaly detection
+            data_entry = {
+                "imu_roll": self.data["imu"]["roll"],
+                "imu_pitch": self.data["imu"]["pitch"],
+                "imu_yaw": self.data["imu"]["yaw"],
+                "imu_ang_vel_x": self.data["imu"]["angular_vel"]["x"],
+                "imu_ang_vel_y": self.data["imu"]["angular_vel"]["y"],
+                "imu_ang_vel_z": self.data["imu"]["angular_vel"]["z"],
+                "imu_lin_acc_x": self.data["imu"]["linear_acc"]["x"],
+                "imu_lin_acc_y": self.data["imu"]["linear_acc"]["y"],
+                "imu_lin_acc_z": self.data["imu"]["linear_acc"]["z"],
+                "odom_vel_linear": self.data["odom"]["velocity"]["linear"],
+                "odom_vel_angular": self.data["odom"]["velocity"]["angular"],
+                "cmd_vel_linear": self.data["cmd_vel"]["linear"],
+                "cmd_vel_angular": self.data["cmd_vel"]["angular"]
+            }
+            
+            is_anomaly, score, features = anomaly_detector.predict(data_entry)
+            
+            self.current_anomaly_status = {
+                "is_anomaly": is_anomaly,
+                "score": score,
+                "features": features
+            }
+            
+            if is_anomaly:
+                current_time = datetime.now().strftime("%H:%M:%S")
+                self.anomaly_alerts.append(
+                    f"[{current_time}] ANOMALY DETECTED: Score={score:.3f}"
+                )
+                
+                # Keep only last 50 anomaly alerts
+                if len(self.anomaly_alerts) > 50:
+                    self.anomaly_alerts = self.anomaly_alerts[-50:]
+        
+        except Exception as e:
+            self.get_logger().warning(f"Anomaly detection error: {str(e)}")
+    
     def log_current_data(self):
         """Log current data point"""
         if self.logging_enabled:
@@ -149,7 +230,12 @@ class HuskyDashboard(Node):
                 "odom_vel_linear": self.data["odom"]["velocity"]["linear"],
                 "odom_vel_angular": self.data["odom"]["velocity"]["angular"],
                 "cmd_vel_linear": self.data["cmd_vel"]["linear"],
-                "cmd_vel_angular": self.data["cmd_vel"]["angular"]
+                "cmd_vel_angular": self.data["cmd_vel"]["angular"],
+                "scan_avg_range": self.data["scan"]["avg_range"],
+                "scan_min_range": self.data["scan"]["min_range"],
+                "scan_max_range": self.data["scan"]["max_range"],
+                "scan_num_readings": self.data["scan"]["num_readings"],
+                "scan_obstacles_detected": self.data["scan"]["obstacles_detected"]
             }
             self.log_data.append(log_entry)
     
@@ -180,6 +266,7 @@ class HuskyDashboard(Node):
         self.history["acceleration_z"].append(msg.linear_acceleration.z)
         
         self.check_alerts()
+        self.check_anomaly()
         self.log_current_data()
     
     def gps_callback(self, msg):
@@ -222,6 +309,37 @@ class HuskyDashboard(Node):
     def diagnostics_callback(self, msg):
         self.data["diagnostics"] = [status.name for status in msg.status]
         self.data["last_update"] = datetime.now().isoformat()
+    
+    def scan_callback(self, msg):
+        """Process laser scan data"""
+        import numpy as np
+        
+        # Filter out invalid readings (inf, nan)
+        ranges = np.array(msg.ranges)
+        valid_ranges = ranges[(ranges >= msg.range_min) & (ranges <= msg.range_max) & np.isfinite(ranges)]
+        
+        if len(valid_ranges) > 0:
+            avg_range = float(np.mean(valid_ranges))
+            min_range = float(np.min(valid_ranges))
+            max_range = float(np.max(valid_ranges))
+            
+            # Count obstacles (readings closer than 2 meters)
+            obstacles = np.sum(valid_ranges < 2.0)
+            
+            self.data["scan"]["range_min"] = round(msg.range_min, 3)
+            self.data["scan"]["range_max"] = round(msg.range_max, 3)
+            self.data["scan"]["avg_range"] = round(avg_range, 3)
+            self.data["scan"]["min_range"] = round(min_range, 3)
+            self.data["scan"]["max_range"] = round(max_range, 3)
+            self.data["scan"]["num_readings"] = len(valid_ranges)
+            self.data["scan"]["obstacles_detected"] = int(obstacles)
+            
+            # Update history
+            self.history["scan_avg_range"].append(avg_range)
+            self.history["scan_min_range"].append(min_range)
+        
+        self.data["last_update"] = datetime.now().isoformat()
+        self.log_current_data()
 
 # Global node instance
 dashboard_node = None
@@ -247,7 +365,9 @@ def get_history():
             "velocity": list(dashboard_node.history["velocity"]),
             "acceleration_x": list(dashboard_node.history["acceleration_x"]),
             "acceleration_y": list(dashboard_node.history["acceleration_y"]),
-            "acceleration_z": list(dashboard_node.history["acceleration_z"])
+            "acceleration_z": list(dashboard_node.history["acceleration_z"]),
+            "scan_avg_range": list(dashboard_node.history["scan_avg_range"]),
+            "scan_min_range": list(dashboard_node.history["scan_min_range"])
         }
         return jsonify(history_data)
     return jsonify({"error": "Node not initialized"})
@@ -325,6 +445,63 @@ def clear_alerts():
         dashboard_node.alerts = []
         return jsonify({"status": "Alerts cleared"})
     return jsonify({"error": "Node not initialized"}), 500
+
+@app.route('/api/anomaly/train', methods=['POST'])
+def train_anomaly_model():
+    """Train anomaly detection model on logged data"""
+    global anomaly_detector
+    
+    data = request.json
+    csv_file = data.get('csv_file')
+    contamination = float(data.get('contamination', 0.1))
+    
+    if not csv_file or not os.path.exists(csv_file):
+        return jsonify({"error": "CSV file not found"}), 400
+    
+    try:
+        anomaly_detector.train(csv_file, contamination=contamination)
+        anomaly_detector.save_model()
+        return jsonify({
+            "status": "Model trained successfully",
+            "features": anomaly_detector.feature_names
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/anomaly/load', methods=['POST'])
+def load_anomaly_model():
+    """Load a trained anomaly detection model"""
+    global anomaly_detector
+    
+    try:
+        anomaly_detector.load_model()
+        return jsonify({
+            "status": "Model loaded successfully",
+            "features": anomaly_detector.feature_names
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/anomaly/status')
+def get_anomaly_status():
+    """Get current anomaly detection status"""
+    if not ANOMALY_DETECTION_AVAILABLE or not anomaly_detector:
+        return jsonify({"error": "Anomaly detection not available"}), 503
+    
+    if dashboard_node:
+        return jsonify({
+            "model_trained": anomaly_detector.is_trained,
+            "current_status": dashboard_node.current_anomaly_status,
+            "recent_anomalies": dashboard_node.anomaly_alerts[-10:] if dashboard_node.anomaly_alerts else []
+        })
+    return jsonify({"error": "Node not initialized"}), 500
+
+@app.route('/api/anomaly/alerts')
+def get_anomaly_alerts():
+    """Get all anomaly alerts"""
+    if dashboard_node:
+        return jsonify({"alerts": dashboard_node.anomaly_alerts})
+    return jsonify({"alerts": []})
 
 def ros_spin():
     rclpy.spin(dashboard_node)
@@ -701,6 +878,34 @@ def create_html_template():
                     <span class="data-value" id="cmd-angular">0.000 rad/s</span>
                 </div>
             </div>
+            
+            <!-- LiDAR Card -->
+            <div class="card">
+                <div class="card-header">
+                    <span class="icon">📡</span>
+                    <span>LiDAR / Laser Scan</span>
+                </div>
+                <div class="data-row">
+                    <span class="data-label">Average Range:</span>
+                    <span class="data-value" id="scan-avg">0.000 m</span>
+                </div>
+                <div class="data-row">
+                    <span class="data-label">Minimum Range:</span>
+                    <span class="data-value" id="scan-min">0.000 m</span>
+                </div>
+                <div class="data-row">
+                    <span class="data-label">Maximum Range:</span>
+                    <span class="data-value" id="scan-max">0.000 m</span>
+                </div>
+                <div class="data-row">
+                    <span class="data-label">Valid Readings:</span>
+                    <span class="data-value" id="scan-readings">0</span>
+                </div>
+                <div class="data-row">
+                    <span class="data-label">Obstacles (<2m):</span>
+                    <span class="data-value" id="scan-obstacles">0</span>
+                </div>
+            </div>
         </div>
         
         <!-- Charts Section -->
@@ -732,6 +937,16 @@ def create_html_template():
                 </div>
                 <div class="chart-container">
                     <canvas id="velocityChart"></canvas>
+                </div>
+            </div>
+            
+            <div class="card full-width">
+                <div class="card-header">
+                    <span class="icon">📡</span>
+                    <span>LiDAR Range Data</span>
+                </div>
+                <div class="chart-container">
+                    <canvas id="lidarChart"></canvas>
                 </div>
             </div>
         </div>
@@ -928,6 +1143,48 @@ def create_html_template():
             }
         });
         
+        const lidarChart = new Chart(document.getElementById('lidarChart'), {
+            type: 'line',
+            data: {
+                labels: [],
+                datasets: [
+                    {
+                        label: 'Average Range',
+                        data: [],
+                        borderColor: '#9966ff',
+                        backgroundColor: 'rgba(153, 102, 255, 0.1)',
+                        tension: 0.4
+                    },
+                    {
+                        label: 'Minimum Range',
+                        data: [],
+                        borderColor: '#ff6384',
+                        backgroundColor: 'rgba(255, 99, 132, 0.1)',
+                        tension: 0.4
+                    }
+                ]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                    legend: {
+                        labels: { color: '#fff' }
+                    }
+                },
+                scales: {
+                    x: { 
+                        ticks: { color: '#fff' },
+                        grid: { color: 'rgba(255,255,255,0.1)' }
+                    },
+                    y: { 
+                        ticks: { color: '#fff' },
+                        grid: { color: 'rgba(255,255,255,0.1)' }
+                    }
+                }
+            }
+        });
+        
         function startLogging() {
             fetch('/api/logging/start', { method: 'POST' })
                 .then(response => response.json())
@@ -1014,6 +1271,13 @@ def create_html_template():
                     document.getElementById('cmd-linear').textContent = data.cmd_vel.linear.toFixed(3) + ' m/s';
                     document.getElementById('cmd-angular').textContent = data.cmd_vel.angular.toFixed(3) + ' rad/s';
                     
+                    // Update LiDAR
+                    document.getElementById('scan-avg').textContent = data.scan.avg_range.toFixed(3) + ' m';
+                    document.getElementById('scan-min').textContent = data.scan.min_range.toFixed(3) + ' m';
+                    document.getElementById('scan-max').textContent = data.scan.max_range.toFixed(3) + ' m';
+                    document.getElementById('scan-readings').textContent = data.scan.num_readings;
+                    document.getElementById('scan-obstacles').textContent = data.scan.obstacles_detected;
+                    
                     // Update Joints
                     const jointsTable = document.getElementById('joints-table').querySelector('tbody');
                     jointsTable.innerHTML = '';
@@ -1070,6 +1334,12 @@ def create_html_template():
                     velocityChart.data.labels = labels;
                     velocityChart.data.datasets[0].data = data.velocity;
                     velocityChart.update('none');
+                    
+                    // Update LiDAR chart
+                    lidarChart.data.labels = labels;
+                    lidarChart.data.datasets[0].data = data.scan_avg_range;
+                    lidarChart.data.datasets[1].data = data.scan_min_range;
+                    lidarChart.update('none');
                 })
                 .catch(error => console.error('Error fetching history:', error));
         }
@@ -1131,10 +1401,22 @@ def create_html_template():
         f.write(html_content)
 
 def main():
-    global dashboard_node
+    global dashboard_node, anomaly_detector
     
     rclpy.init()
     dashboard_node = HuskyDashboard()
+    
+    # Try to load existing anomaly detection model
+    if ANOMALY_DETECTION_AVAILABLE and anomaly_detector:
+        try:
+            anomaly_detector.load_model()
+            print("✅ Anomaly detection model loaded successfully")
+        except FileNotFoundError:
+            print("ℹ️  No pre-trained anomaly model found (train one with train_anomaly_model.py)")
+        except Exception as e:
+            print(f"⚠️  Error loading anomaly model: {str(e)}")
+    else:
+        print("ℹ️  Anomaly detection module not available")
     
     # Create HTML template
     create_html_template()
@@ -1171,3 +1453,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+

@@ -30,6 +30,16 @@ Supports IMU, GPS, Odometry, LiDAR, Joint States, Cmd Vel, and Diagnostics.
 
 * Start/stop data logging
 * Export CSV with timestamps and all sensor fields
+* **LiDAR/Laser scan data recording** (avg/min/max range, obstacles)
+* See [LIDAR_RECORDING.md](LIDAR_RECORDING.md) for LiDAR details
+
+### 🆕 **Machine Learning Anomaly Detection**
+
+* **Train on normal robot behavior** from logged data
+* **Real-time anomaly detection** using Isolation Forest
+* **Automatic alerts** for unusual sensor patterns
+* **Identify**: sensor malfunctions, mechanical issues, abnormal behavior
+* See [ANOMALY_DETECTION.md](ANOMALY_DETECTION.md) for complete guide
 
 ### Security Testing
 
@@ -64,7 +74,12 @@ sudo apt install ros-foxy-rosbag2-bag-v2-plugins
 ### Python Dependencies
 
 ```
-pip3 install flask flask-cors numpy
+pip3 install -r requirements.txt
+```
+
+Or manually:
+```
+pip3 install flask flask-cors numpy waitress scikit-learn pandas joblib
 ```
 
 ### Optional (ROS1 bag conversion):
@@ -100,6 +115,15 @@ ros2 pkg list | grep husky
 ---
 
 ## Usage
+
+### Quick Start: Anomaly Detection
+
+See [ANOMALY_DETECTION.md](ANOMALY_DETECTION.md) for complete ML setup guide.
+
+**TL;DR:**
+1. Collect data → Export CSV from dashboard
+2. Train model: `python3 train_anomaly_model.py your_data.csv`
+3. Run dashboard → Model auto-loads and detects anomalies!
 
 ### Terminal 1: Launch Husky in Gazebo
 
